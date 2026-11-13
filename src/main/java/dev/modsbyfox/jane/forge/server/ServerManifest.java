@@ -1,0 +1,139 @@
+package dev.modsbyfox.jane.forge.server;
+
+import dev.modsbyfox.jane.core.ClientSyncDecision;
+import dev.modsbyfox.jane.core.Hashing;
+import dev.modsbyfox.jane.core.ManifestEntry;
+import dev.modsbyfox.jane.core.PathSafety;
+import dev.modsbyfox.jane.core.RequiredManifest;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/** The loaded physical Forge JAR set is the required client baseline. */
+final class ServerManifest {
+    private static final Logger LOGGER = LoggerFactory.getLogger("jane");
+    private static boolean legacyWarned;
+
+    record JarData(long size, String sha512) { }
+    record Classified(ServerDiscovery.Discovered discovered, JarData jar,
+                      ClientSyncDecision decision, String reason) { }
+    record BuildResult(RequiredManifest manifest, List<Classified> classified) { }
+    record Prepared(RequiredManifest manifest, Map<String, Path> files) { }
+
+    private ServerManifest() { }
+
+    static Prepared prepare(Path gameDir, ServerConfig.Config config) throws IOException {
+        if (config.legacyFieldsPresent() && !legacyWarned) {
+            legacyWarned = true;
+            LOGGER.warn("{}ignores legacy requiredMods and environmentOverrides; AUTO_DISCOVER is active", "[server] ");
+        }
+        ServerDiscovery.Discovery discovery = ServerDiscovery.discover(gameDir);
+        BuildResult result = build(discovery.mods(), gameDir);
+        DiscoveredModsStore.write(gameDir, result.classified(), discovery.skipped());
+        long sync = result.classified().stream().filter(item -> item.decision() == ClientSyncDecision.SYNC).count();
+        LOGGER.info("[server] discovery summary: physicalForgeJars=" + discovery.mods().size()
+                + ", sync=" + sync + ", excluded=" + (result.classified().size() - sync)
+                + ", skippedPhysicalJars=" + discovery.skipped().size()
+                + ", manifestEntries=" + result.manifest().entries().size());
+        Map<String, Path> files = new HashMap<>();
+        for (Classified item : result.classified()) {
+            if (item.decision() == ClientSyncDecision.SYNC)
+                files.put(item.jar().sha512(), item.discovered().jar());
+        }
+        return new Prepared(result.manifest(), Map.copyOf(files));
+    }
+
+    static BuildResult build(List<ServerDiscovery.Discovered> discovered, Path gameDir) throws IOException {
+        List<Classified> classified = new ArrayList<>();
+        List<ManifestEntry> required = new ArrayList<>();
+        Path blacklist = PathSafety.janeDirectory(gameDir, "blacklist");
+        if (!Files.isDirectory(blacklist, LinkOption.NOFOLLOW_LINKS))
+            throw new IOException("Jane blacklist is not a directory");
+        for (ServerDiscovery.Discovered item : discovered.stream()
+                .sorted(Comparator.comparing(value -> value.candidate().modId())).toList()) {
+            ServerDiscovery.Candidate candidate = item.candidate();
+            if (candidate.bundledIds().contains("jane")) {
+                classified.add(new Classified(item, null, ClientSyncDecision.EXCLUDE, "jane_internal"));
+                LOGGER.info("{}discovery modId={} decision=EXCLUDE reason=jane_internal", "[server] ", candidate.modId());
+                continue;
+            }
+            if (candidate.serverOnly()) {
+                classified.add(new Classified(item, null, ClientSyncDecision.EXCLUDE, "forge_server_only"));
+                LOGGER.info("{}discovery modId={} decision=EXCLUDE reason=forge_server_only", "[server] ", candidate.modId());
+                continue;
+            }
+            Path safe = PathSafety.existingJarInMods(gameDir, item.jar());
+            JarData jar = readJar(safe, candidate.modId());
+            if (matchesBlacklist(blacklist, safe, jar)) {
+                classified.add(new Classified(item, null, ClientSyncDecision.EXCLUDE, "blacklist_exact_copy"));
+                LOGGER.info("{}discovery modId={} decision=EXCLUDE reason=blacklist_exact_copy",
+                        "[server] ", candidate.modId());
+                continue;
+            }
+            try {
+                required.add(new ManifestEntry(candidate.modId(), candidate.displayName(), candidate.version(),
+                        jar.size(), jar.sha512()));
+            } catch (IllegalArgumentException exception) {
+                throw new IOException("Invalid discovered manifest entry: " + candidate.modId(), exception);
+            }
+            if (required.size() > RequiredManifest.MAX_ENTRIES)
+                throw new IOException("Jane discovered more client-sync entries than Protocol "
+                        + RequiredManifest.PROTOCOL + " supports");
+            classified.add(new Classified(item, jar, ClientSyncDecision.SYNC, "physical_client_target"));
+            LOGGER.info("{}discovery modId={} decision=SYNC reason=physical_client_target", "[server] ", candidate.modId());
+        }
+        try {
+            RequiredManifest manifest = new RequiredManifest(RequiredManifest.PROTOCOL, required);
+            LOGGER.info("[server] physical discovery: " + classified.size() + " Forge JARs, "
+                    + required.size() + " client-sync entries");
+            return new BuildResult(manifest, List.copyOf(classified));
+        } catch (IllegalArgumentException exception) {
+            throw new IOException("Invalid physical required manifest", exception);
+        }
+    }
+
+    private static JarData readJar(Path jar, String id) throws IOException {
+        if (Files.isSymbolicLink(jar) || !Files.isRegularFile(jar, LinkOption.NOFOLLOW_LINKS))
+            throw new IOException("Required JAR is not a regular file: " + id);
+        long size = Files.size(jar);
+        if (size <= 0 || size > ManifestEntry.MAX_FILE_SIZE)
+            throw new IOException("Required JAR size is invalid: " + id);
+        FileTime modified = Files.getLastModifiedTime(jar);
+        String hash = Hashing.sha512(jar);
+        if (Files.size(jar) != size || !Files.getLastModifiedTime(jar).equals(modified))
+            throw new IOException("Required JAR changed while hashing: " + id);
+        return new JarData(size, hash);
+    }
+
+    private static boolean matchesBlacklist(Path blacklist, Path jar, JarData target) throws IOException {
+        Path copy = blacklist.resolve(jar.getFileName());
+        if (!Files.exists(copy, LinkOption.NOFOLLOW_LINKS)) return false;
+        if (Files.isSymbolicLink(copy) || !Files.isRegularFile(copy, LinkOption.NOFOLLOW_LINKS)
+                || !copy.toRealPath().getParent().equals(blacklist))
+            throw new IOException("Unsafe Jane blacklist JAR: " + jar.getFileName());
+        long size = Files.size(copy);
+        if (size != target.size()) {
+            LOGGER.warn("{}blacklist copy differs from mods JAR; file={}", "[server] ", jar.getFileName());
+            return false;
+        }
+        FileTime modified = Files.getLastModifiedTime(copy, LinkOption.NOFOLLOW_LINKS);
+        String hash = Hashing.sha512(copy);
+        if (Files.isSymbolicLink(copy) || !Files.isRegularFile(copy, LinkOption.NOFOLLOW_LINKS)
+                || !copy.toRealPath().getParent().equals(blacklist)
+                || Files.size(copy) != size
+                || !Files.getLastModifiedTime(copy, LinkOption.NOFOLLOW_LINKS).equals(modified))
+            throw new IOException("Jane blacklist JAR changed while hashing: " + jar.getFileName());
+        if (!target.sha512().equals(hash))
+            LOGGER.warn("{}blacklist copy differs from mods JAR; file={}", "[server] ", jar.getFileName());
+        return target.sha512().equals(hash);
+    }
+}

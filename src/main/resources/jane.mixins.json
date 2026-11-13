@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "dev.modsbyfox.jane.forge.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "jane.refmap.json",
+  "mixins": [
+    "ConnectionChannelAccessor",
+    "ServerLoginTakeoverMixin",
+    "ForgeHandshakePriorityMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
