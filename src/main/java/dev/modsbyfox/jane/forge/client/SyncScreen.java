@@ -60,6 +60,7 @@ final class SyncScreen extends Screen {
     private Button cancelButton;
     private Button quickTrustedButton;
     private Button quickServerButton;
+    private SyncSelectionPanel selectionPanel;
 
     SyncScreen(Screen parent, PendingSyncContext context, ReconnectTarget reconnectTarget) {
         this(parent, context, reconnectTarget, false);
@@ -96,7 +97,7 @@ final class SyncScreen extends Screen {
                 minecraft.setScreen(new SyncDetailsScreen(this, session)))
                 .bounds(layout.compact() ? layout.compactFooterX(0) : width / 2 - footerWidth - 3,
                         layout.footerY(), footerWidth, 20).build());
-        cancelButton = addRenderableWidget(JaneUiText.button(Component.translatable("jane.sync.cancel"), button -> onClose())
+        cancelButton = addRenderableWidget(JaneUiText.button(Component.translatable("jane.sync.cancel"), button -> cancelSync())
                 .bounds(layout.compact() ? layout.compactFooterX(2) : width / 2 + 3,
                         layout.footerY(), footerWidth, 20).build());
         if (layout.compact()) {
@@ -114,6 +115,10 @@ final class SyncScreen extends Screen {
                 Component.translatable("jane.sync.quick_server"), button ->
                         requestRouteSwitch(ResolutionPlan.TransferRoute.CURRENT_SERVER))
                 .bounds(layout.quickButtonX(1), layout.quickButtonsY(), layout.quickButtonWidth(), 20).build());
+        if (selectionPanel == null) {
+            selectionPanel = new SyncSelectionPanel(this, session, selection, font);
+            selectionPanel.expandRequiredOnFirstShow();
+        } else selectionPanel.resetDrag();
         // Minecraft calls init again when returning from Details or a confirmation screen.
         // beginResolution is a session-level one-shot guard, so no second lookup is launched.
         beginResolve();
@@ -456,10 +461,25 @@ final class SyncScreen extends Screen {
         }));
     }
 
+    private boolean splitActive() {
+        return resolved && SplitSyncLayout.enabled(width, height);
+    }
+
+    private SelectionScreenLayout selectionLayout() {
+        SplitSyncLayout layout = SplitSyncLayout.forSize(width, height);
+        return SelectionScreenLayout.forBounds(layout.rightLeft(), layout.rightRight(), height);
+    }
+
     @Override public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
         renderBackground(graphics);
         JaneSyncSession.Snapshot snapshot = session.snapshot();
         updateButtons(snapshot);
+        if (splitActive()) {
+            renderSplit(graphics, mouseX, mouseY, snapshot);
+            super.render(graphics, mouseX, mouseY, partialTick);
+            drawQuickSourceFeedback(graphics, mouseX, mouseY, snapshot);
+            return;
+        }
         ClassicSyncLayout layout = ClassicSyncLayout.forSize(width, height);
         JaneUiText.centered(graphics, font, title, width / 2, layout.tiny() ? 5 : 8, 0xFFFFFF);
         if (!layout.tiny() || !snapshot.running()) {
@@ -480,6 +500,166 @@ final class SyncScreen extends Screen {
         drawQuickSourceHint(graphics, snapshot, layout);
         super.render(graphics, mouseX, mouseY, partialTick);
         drawQuickSourceFeedback(graphics, mouseX, mouseY, snapshot);
+    }
+
+    private void renderSplit(GuiGraphics graphics, int mouseX, int mouseY,
+                             JaneSyncSession.Snapshot snapshot) {
+        SplitSyncLayout layout = SplitSyncLayout.forSize(width, height);
+        graphics.fill(4, 4, layout.dividerX() - 4, height - 4, 0x88000000);
+        graphics.fill(layout.dividerX() - 1, 4, layout.dividerX(), height - 4, 0x88555555);
+        int center = layout.leftCenter();
+        int textWidth = layout.leftWidth() - 4;
+        JaneUiText.centered(graphics, font, title, center, 8, 0xFFFFFF);
+        int y = drawSplitLines(graphics, Component.translatable("jane.sync.mismatch"),
+                center, 22, textWidth, 0xFFAA55, 2);
+        y = drawSplitLines(graphics, Component.translatable("jane.sync.counts",
+                        count(Comparison.Status.MISSING), count(Comparison.Status.VERSION_MISMATCH),
+                        count(Comparison.Status.HASH_MISMATCH) + count(Comparison.Status.FILE_ERROR)),
+                center, y + 2, textWidth, 0xFFFFFF, 3) + 3;
+        if (snapshot.running()) renderSplitProgress(graphics, snapshot, layout, y);
+        else renderSplitSummary(graphics, snapshot, layout, y);
+        if (quickTrustedButton.visible) {
+            JaneUiText.centered(graphics, font, fit(Component.translatable(routeSwitch.pending()
+                            ? "jane.sync.quick_switching" : "jane.sync.quick_heading").getString(), textWidth),
+                    center, layout.quickHeaderY(), 0xDDDDDD);
+            drawSplitQuickSourceHint(graphics, snapshot, layout);
+        }
+        selectionPanel.render(graphics, selectionLayout(), mouseX, mouseY);
+    }
+
+    /** Draw at most the available lines and return the baseline after them. */
+    private int drawSplitLines(GuiGraphics graphics, Component message, int center, int y,
+                               int textWidth, int color, int maxLines) {
+        var lines = JaneUiText.split(font, message, textWidth);
+        int shown = Math.min(maxLines, lines.size());
+        for (int index = 0; index < shown; index++)
+            JaneUiText.centered(graphics, font, lines.get(index), center, y + index * 11, color);
+        return y + shown * 11;
+    }
+
+    private void renderSplitSummary(GuiGraphics graphics, JaneSyncSession.Snapshot snapshot,
+                                    SplitSyncLayout layout, int firstY) {
+        ResolutionPlan plan = snapshot.resolution();
+        if (plan == null) return;
+        int center = layout.leftCenter();
+        int textWidth = layout.leftWidth() - 4;
+        int y = firstY;
+        if (selectedAvailabilityCount(snapshot, ResolutionPlan.Availability.TRUSTED_AVAILABLE) > 0) {
+            drawSplitGroup(graphics, "jane.sync.trusted_available", snapshot,
+                    ResolutionPlan.Availability.TRUSTED_AVAILABLE, layout, y, 0xAAFFAA);
+            y += 25;
+        }
+        if (selectedAvailabilityCount(snapshot, ResolutionPlan.Availability.SERVER_ONLY) > 0) {
+            drawSplitGroup(graphics, "jane.sync.server_only", snapshot,
+                    ResolutionPlan.Availability.SERVER_ONLY, layout, y, 0xFFCC77);
+            y += 25;
+        }
+        Component issue = null;
+        if (auditWarning) issue = Component.translatable("jane.select.audit_incomplete");
+        else if (snapshot.localErrorCount() > 0)
+            issue = Component.translatable("jane.sync.local_runtime_error_count", snapshot.localErrorCount());
+        else if (plan.count(ResolutionPlan.Availability.LOCAL_ERROR) > 0)
+            issue = Component.translatable("jane.sync.local_error_count",
+                    plan.count(ResolutionPlan.Availability.LOCAL_ERROR));
+        else if (plan.count(ResolutionPlan.Availability.LOOKUP_FAILED) > 0)
+            issue = Component.translatable("jane.sync.lookup_failed_count",
+                    plan.count(ResolutionPlan.Availability.LOOKUP_FAILED));
+        if (issue != null) {
+            JaneUiText.centered(graphics, font, fit(issue.getString(), textWidth), center, y, 0xFF7777);
+            y += 12;
+        }
+        int noticeBottom = y;
+        if (notice != null) {
+            var lines = JaneUiText.split(font, notice, textWidth);
+            int shown = 0;
+            int noticeY = -1;
+            for (int count = Math.min(3, lines.size()); count > 0; count--) {
+                int candidate = layout.noticeY(y + 3, count, retryButton.visible);
+                if (candidate < 0) continue;
+                shown = count;
+                noticeY = candidate;
+                break;
+            }
+            if (noticeY >= 0) {
+                for (int index = 0; index < shown; index++)
+                    JaneUiText.centered(graphics, font, lines.get(index), center,
+                            noticeY + index * 11, auditWarning ? 0xFF7777 : 0xFFCC77);
+                noticeBottom = noticeY + (shown - 1) * 11;
+            }
+        }
+        if (ready != null) {
+            int hintY = noticeBottom + 14;
+            var lines = JaneUiText.split(font, Component.translatable("jane.sync.confirm_move_hint"), textWidth);
+            for (int index = 0; index < lines.size()
+                    && hintY + index * 11 + 9 < layout.actionTop(false); index++)
+                JaneUiText.centered(graphics, font, lines.get(index), center,
+                        hintY + index * 11, 0xBBBBBB);
+        }
+    }
+
+    private void drawSplitGroup(GuiGraphics graphics, String label, JaneSyncSession.Snapshot snapshot,
+                                ResolutionPlan.Availability availability, SplitSyncLayout layout,
+                                int y, int color) {
+        int center = layout.leftCenter();
+        int textWidth = layout.leftWidth() - 4;
+        JaneUiText.centered(graphics, font,
+                fit(Component.translatable(label).getString(), textWidth), center, y, 0xFFFFFF);
+        Component size = Component.translatable("jane.sync.size_count",
+                selectedAvailabilityCount(snapshot, availability),
+                mib(selectedAvailabilitySize(snapshot, availability)));
+        JaneUiText.centered(graphics, font, fit(size.getString(), textWidth), center, y + 12, color);
+    }
+
+    private void renderSplitProgress(GuiGraphics graphics, JaneSyncSession.Snapshot snapshot,
+                                     SplitSyncLayout layout, int firstY) {
+        JaneSyncSession.ItemState current = snapshot.items().stream().filter(item ->
+                selection.isSelected(item.item().comparison().required().modId())
+                        && (item.state() == JaneSyncSession.RuntimeState.DOWNLOADING
+                        || item.state() == JaneSyncSession.RuntimeState.VERIFYING
+                        || item.state() == JaneSyncSession.RuntimeState.RESOLVING)).findFirst().orElse(null);
+        int total = selection.selectedUnmatchedModIds().size();
+        String name = current == null ? Component.translatable("jane.sync.preparing_item").getString()
+                : current.item().comparison().required().displayName();
+        int center = layout.leftCenter();
+        int textWidth = layout.leftWidth() - 4;
+        String item = Component.translatable("jane.sync.current_item", name,
+                Math.min(total, (int) snapshot.readyCount() + 1), total).getString();
+        JaneUiText.centered(graphics, font, fit(item, textWidth), center, firstY, 0xFFFFFF);
+        int barY = firstY + 14;
+        int barWidth = layout.barWidth();
+        int barX = layout.barX(barWidth);
+        int progress = Math.max(0, Math.min(100, snapshot.overallProgressPercent()));
+        graphics.fill(barX, barY, barX + barWidth, barY + 8, 0xFF555555);
+        graphics.fill(barX, barY, barX + barWidth * progress / 100, barY + 8, 0xFF55AA55);
+        String route = Component.translatable(snapshot.activeRoute() == ResolutionPlan.TransferRoute.CURRENT_SERVER
+                ? "jane.details.current_server" : "jane.details.trusted_source").getString();
+        JaneUiText.centered(graphics, font, fit(Component.translatable("jane.sync.route_progress", route,
+                progress).getString(), textWidth), center, barY + 11, 0xFFCC77);
+    }
+
+    private void drawSplitQuickSourceHint(GuiGraphics graphics, JaneSyncSession.Snapshot snapshot,
+                                          SplitSyncLayout layout) {
+        AtomicBoolean token = activeTransferCancel;
+        if (snapshot.error() != null || snapshot.localErrorCount() > 0 || routeSwitch.pending()
+                || token == null || token.get()) return;
+        boolean providerAvailable = session.context().provider() != null;
+        boolean alternativeAvailable = snapshot.activeRoute() == ResolutionPlan.TransferRoute.TRUSTED_SOURCE
+                ? DownloadRouteSwitch.available(snapshot,
+                ResolutionPlan.TransferRoute.CURRENT_SERVER, providerAvailable)
+                : snapshot.activeRoute() == ResolutionPlan.TransferRoute.CURRENT_SERVER
+                && DownloadRouteSwitch.available(snapshot,
+                ResolutionPlan.TransferRoute.TRUSTED_SOURCE, providerAvailable);
+        int hintY = layout.quickHintY(alternativeAvailable ? 2 : 1);
+        if (hintY < 0) return;
+        int center = layout.leftCenter();
+        int textWidth = layout.leftWidth() - 4;
+        JaneUiText.centered(graphics, font, fit(Component.translatable(alternativeAvailable
+                ? "jane.sync.quick_slow_switch" : "jane.sync.quick_slow_network").getString(), textWidth),
+                center, hintY, 0xAAAAAA);
+        if (alternativeAvailable)
+            JaneUiText.centered(graphics, font,
+                    fit(Component.translatable("jane.sync.quick_slow_both").getString(), textWidth),
+                    center, hintY + 11, 0xAAAAAA);
     }
 
     private void drawQuickSourceHint(GuiGraphics graphics, JaneSyncSession.Snapshot snapshot,
@@ -746,8 +926,17 @@ final class SyncScreen extends Screen {
     private void updateButtons(JaneSyncSession.Snapshot snapshot) {
         downloadButton.visible = retryButton.visible = false;
         cancelTransferButton.visible = finishButton.visible = false;
-        selectionButton.visible = !snapshot.running();
+        selectionButton.visible = !snapshot.running() && !splitActive();
         selectionButton.active = !launching && !sessionCancelled.get();
+        if (splitActive()) {
+            SplitSyncLayout split = SplitSyncLayout.forSize(width, height);
+            detailsButton.setX(split.leftX());
+            detailsButton.setY(split.detailsY());
+            detailsButton.setWidth(split.leftWidth());
+            cancelButton.setX(split.leftX());
+            cancelButton.setY(split.cancelY());
+            cancelButton.setWidth(split.leftWidth());
+        }
         updateQuickButtons(snapshot);
         if (launching) return;
         Button primary = downloadButton;
@@ -778,13 +967,23 @@ final class SyncScreen extends Screen {
         boolean shown = snapshot.running() && !launching && ready == null && !sessionCancelled.get();
         quickTrustedButton.visible = quickServerButton.visible = shown;
         if (!shown) return;
-        ClassicSyncLayout layout = ClassicSyncLayout.forSize(width, height);
-        quickTrustedButton.setX(layout.quickButtonX(0));
-        quickTrustedButton.setY(layout.quickButtonsY());
-        quickTrustedButton.setWidth(layout.quickButtonWidth());
-        quickServerButton.setX(layout.quickButtonX(1));
-        quickServerButton.setY(layout.quickButtonsY());
-        quickServerButton.setWidth(layout.quickButtonWidth());
+        if (splitActive()) {
+            SplitSyncLayout layout = SplitSyncLayout.forSize(width, height);
+            quickTrustedButton.setX(layout.quickButtonX(0));
+            quickTrustedButton.setY(layout.quickButtonsY());
+            quickTrustedButton.setWidth(layout.quickButtonWidth());
+            quickServerButton.setX(layout.quickButtonX(1));
+            quickServerButton.setY(layout.quickButtonsY());
+            quickServerButton.setWidth(layout.quickButtonWidth());
+        } else {
+            ClassicSyncLayout layout = ClassicSyncLayout.forSize(width, height);
+            quickTrustedButton.setX(layout.quickButtonX(0));
+            quickTrustedButton.setY(layout.quickButtonsY());
+            quickTrustedButton.setWidth(layout.quickButtonWidth());
+            quickServerButton.setX(layout.quickButtonX(1));
+            quickServerButton.setY(layout.quickButtonsY());
+            quickServerButton.setWidth(layout.quickButtonWidth());
+        }
         boolean trustedSelected = snapshot.activeRoute() == ResolutionPlan.TransferRoute.TRUSTED_SOURCE;
         boolean serverSelected = snapshot.activeRoute() == ResolutionPlan.TransferRoute.CURRENT_SERVER;
         quickTrustedButton.setMessage(quickLabel("jane.sync.quick_trusted", trustedSelected));
@@ -805,6 +1004,20 @@ final class SyncScreen extends Screen {
     }
 
     private void placeMain(Button primary, Button secondary) {
+        if (splitActive()) {
+            SplitSyncLayout layout = SplitSyncLayout.forSize(width, height);
+            primary.visible = true;
+            primary.setX(layout.leftX());
+            primary.setY(layout.primaryY());
+            primary.setWidth(layout.leftWidth());
+            if (secondary != null) {
+                secondary.visible = true;
+                secondary.setX(layout.leftX());
+                secondary.setY(layout.retryY());
+                secondary.setWidth(layout.leftWidth());
+            }
+            return;
+        }
         ClassicSyncLayout layout = ClassicSyncLayout.forSize(width, height);
         primary.visible = true;
         primary.setY(layout.mainY());
@@ -940,7 +1153,36 @@ final class SyncScreen extends Screen {
             catch (IOException exception) { LOGGER.warn("Could not discard Jane staging workspace", exception); }
         });
     }
+
+    @Override public boolean mouseScrolled(double mouseX, double mouseY, double amount) {
+        if (splitActive() && selectionPanel.mouseScrolled(mouseX, mouseY, amount, selectionLayout()))
+            return true;
+        return super.mouseScrolled(mouseX, mouseY, amount);
+    }
+
+    @Override public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        if (super.mouseClicked(mouseX, mouseY, button)) return true;
+        return splitActive() && selectionPanel.mouseClicked(mouseX, mouseY, button, selectionLayout());
+    }
+
+    @Override public boolean mouseDragged(double mouseX, double mouseY, int button,
+                                           double dragX, double dragY) {
+        if (splitActive()
+                && selectionPanel.mouseDragged(mouseX, mouseY, button, dragX, dragY, selectionLayout()))
+            return true;
+        return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
+    }
+
+    @Override public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        if (splitActive() && selectionPanel.mouseReleased(mouseX, mouseY, button)) return true;
+        return super.mouseReleased(mouseX, mouseY, button);
+    }
+
     @Override public void onClose() {
+        cancelSync();
+    }
+
+    private void cancelSync() {
         audit("USER_CANCEL_SYNC", Map.of("selectedCount", Integer.toString(selection.selectedUnmatchedModIds().size())));
         if (ready == null) {
             sessionCancelled.set(true);
