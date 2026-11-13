@@ -23,7 +23,7 @@ run
 logs
 run-data
 jane-forge-backup.zip
-/README.md
+/README.local.md
 
 # Files from Forge MDK
 forge*changelog.txt
