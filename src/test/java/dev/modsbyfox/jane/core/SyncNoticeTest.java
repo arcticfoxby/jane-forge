@@ -38,7 +38,7 @@ class SyncNoticeTest {
         assertFalse(session.snapshot().started());
     }
 
-    @Test void failedLookupHasDistinctNoticeAndBlocksInstall() throws Exception {
+    @Test void failedLookupWithServerRequiresConfirmedFallback() throws Exception {
         ManifestEntry entry = new ManifestEntry("example", "Example", "1", 10, HASH);
         RequiredManifest manifest = new RequiredManifest(RequiredManifest.PROTOCOL, List.of(entry));
         var comparisons = Comparison.compare(manifest, Map.of(), path -> HASH);
@@ -46,6 +46,26 @@ class SyncNoticeTest {
                 new ServerProviderOffer(25566, "a".repeat(64))));
         session.publishResolution(ResolutionPlan.resolve(comparisons, target -> { throw new java.io.IOException("timeout"); },
                 true, ignored -> { }));
+        assertEquals(ResolutionPlan.Availability.SERVER_ONLY,
+                session.snapshot().resolution().items().get(0).availability());
+        assertEquals(SyncNotice.Kind.SERVER_ONLY_REMAINING, SyncNotice.select(session.snapshot(), false));
+        assertFalse(session.snapshot().canInstall());
+        assertFalse(session.startTransfer(ResolutionPlan.TransferGroup.SERVER_ONLY,
+                ResolutionPlan.TransferRoute.CURRENT_SERVER));
+        DownloadCoordinator coordinator = new DownloadCoordinator(true, true, true);
+        assertEquals(DownloadCoordinator.Action.SERVER_ONLY_CONFIRM, coordinator.next(session.snapshot()));
+        coordinator.confirmServerOnly();
+        assertEquals(DownloadCoordinator.Action.SERVER_ONLY, coordinator.next(session.snapshot()));
+        assertTrue(session.startServerOnlyConfirmed());
+    }
+
+    @Test void failedLookupWithoutServerHasDistinctNoticeAndBlocksInstall() throws Exception {
+        ManifestEntry entry = new ManifestEntry("example", "Example", "1", 10, HASH);
+        RequiredManifest manifest = new RequiredManifest(RequiredManifest.PROTOCOL, List.of(entry));
+        var comparisons = Comparison.compare(manifest, Map.of(), path -> HASH);
+        JaneSyncSession session = new JaneSyncSession(new PendingSyncContext("example.org", manifest, comparisons));
+        session.publishResolution(ResolutionPlan.resolve(comparisons, target -> { throw new java.io.IOException("timeout"); },
+                false, ignored -> { }));
         assertEquals(ResolutionPlan.Availability.LOOKUP_FAILED,
                 session.snapshot().resolution().items().get(0).availability());
         assertEquals(SyncNotice.Kind.LOOKUP_FAILED, SyncNotice.select(session.snapshot(), false));

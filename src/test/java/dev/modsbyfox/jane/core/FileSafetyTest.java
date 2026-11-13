@@ -35,10 +35,15 @@ class FileSafetyTest {
     void rejectsTraversalShellCharactersAndForeignJar() throws Exception {
         Files.createDirectory(gameDir.resolve("mods"));
         for (String name : new String[]{"../x.jar", "C:\\x.jar", "evil&name.jar", "evil%name.jar", "evil^name.jar",
-                "evil(name).jar", "evil!name.jar", "bad..jar", "CON.jar", "中文.jar"}) {
+                "evil!name.jar", "bad..jar", "CON.jar", "COM¹.jar", "CON .jar", " .jar",
+                " leading.jar", "trailing .jar", ".hidden.jar", "evil\u202e.jar", "evil\uD800.jar"}) {
             assertThrows(IllegalArgumentException.class, () -> PathSafety.safeJarName(name), name);
         }
         assertEquals("fabric-api-0.92.8+1.20.1.jar", PathSafety.safeJarName("fabric-api-0.92.8+1.20.1.jar"));
+        for (String name : new String[]{"中文.jar", "SecurityCraft (1.20.1).jar", "[安全工艺]SecurityCraft.jar",
+                "Krypton Reno Forge.jar", "【农夫乐事】farmers-delight-fabric-1.4.3.jar"}) {
+            assertEquals(name, PathSafety.safeJarName(name));
+        }
         Path inside = Files.writeString(gameDir.resolve("mods/ok.jar"), "ok");
         assertEquals(inside.toRealPath(), PathSafety.existingJarInMods(gameDir, inside));
         Path outside = Files.writeString(gameDir.resolve("outside.jar"), "bad");
@@ -52,7 +57,7 @@ class FileSafetyTest {
         String name = "【农夫乐事】farmers-delight-fabric-1.4.3.jar";
         Path jar = Files.writeString(mods.resolve(name), "old");
         assertEquals(name, PathSafety.safeExistingJarName(name));
-        assertThrows(IllegalArgumentException.class, () -> PathSafety.safeJarName(name));
+        assertEquals(name, PathSafety.safeJarName(name));
         assertEquals(jar.toRealPath(), PathSafety.existingJarInMods(gameDir, jar));
         assertEquals(jar.toRealPath(), PathSafety.existingJarNamedInMods(gameDir, name));
         for (String unsafe : new String[]{"", ".", "..", ".jar", "../evil.jar", "..\\evil.jar",

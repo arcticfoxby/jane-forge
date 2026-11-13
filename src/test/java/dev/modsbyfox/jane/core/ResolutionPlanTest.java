@@ -63,14 +63,14 @@ class ResolutionPlanTest {
         assertFalse(session.snapshot().started());
     }
 
-    @Test void availabilityDistinguishesLookupFailureFromMissingPublicHashAndRetryPreservesSuccesses() throws Exception {
+    @Test void lookupFailuresWithoutServerCanRetryWithoutChangingResolvedItems() throws Exception {
         List<Comparison.Result> comparisons = missing(3);
         ResolutionPlan plan = ResolutionPlan.resolve(comparisons, entry -> {
             if (entry.modId().equals("mod1")) throw new IOException("network unavailable");
             return entry.modId().equals("mod2") ? Optional.empty() : Optional.of(source(entry));
-        }, true, count -> { });
+        }, false, count -> { });
         assertEquals(List.of(ResolutionPlan.Availability.TRUSTED_AVAILABLE,
-                ResolutionPlan.Availability.LOOKUP_FAILED, ResolutionPlan.Availability.SERVER_ONLY),
+                ResolutionPlan.Availability.LOOKUP_FAILED, ResolutionPlan.Availability.UNRESOLVED),
                 plan.items().stream().map(ResolutionPlan.Item::availability).toList());
         assertNull(plan.items().get(1).trustedSource());
         AtomicInteger retried = new AtomicInteger();
@@ -78,12 +78,12 @@ class ResolutionPlanTest {
             retried.incrementAndGet();
             assertEquals("mod1", entry.modId());
             return Optional.of(source(entry));
-        }, true);
+        }, false);
         assertEquals(1, retried.get());
         assertSame(plan.items().get(0), refreshed.items().get(0));
         assertSame(plan.items().get(2), refreshed.items().get(2));
         assertEquals(2, refreshed.count(ResolutionPlan.Availability.TRUSTED_AVAILABLE));
-        assertEquals(1, refreshed.count(ResolutionPlan.Availability.SERVER_ONLY));
+        assertEquals(1, refreshed.count(ResolutionPlan.Availability.UNRESOLVED));
         assertEquals(0, refreshed.count(ResolutionPlan.Availability.LOOKUP_FAILED));
         assertEquals(ResolutionPlan.Availability.UNRESOLVED, ResolutionPlan.resolve(missing(1),
                 entry -> Optional.empty()).items().get(0).availability());
@@ -95,8 +95,12 @@ class ResolutionPlanTest {
                 comparisons.stream().map(Comparison.Result::required).toList());
         JaneSyncSession session = new JaneSyncSession(new PendingSyncContext("example.org", manifest, comparisons,
                 new ServerProviderOffer(25566, "a".repeat(64))));
-        session.publishResolution(ResolutionPlan.resolve(comparisons, entry -> entry.modId().equals("mod0")
-                ? Optional.of(source(entry)) : Optional.empty(), true, count -> { }));
+        session.publishResolution(ResolutionPlan.resolve(comparisons, entry -> {
+            if (entry.modId().equals("mod1")) throw new IOException("Invalid Modrinth response");
+            return Optional.of(source(entry));
+        }, true, count -> { }));
+        assertEquals(ResolutionPlan.Availability.SERVER_ONLY,
+                session.snapshot().items().get(1).item().availability());
         assertTrue(session.startTransfer(ResolutionPlan.TransferGroup.TRUSTED, ResolutionPlan.TransferRoute.TRUSTED_SOURCE));
         assertFalse(session.startTransfer(ResolutionPlan.TransferGroup.TRUSTED, ResolutionPlan.TransferRoute.CURRENT_SERVER));
         session.finishTransfer(true, null);
@@ -139,7 +143,7 @@ class ResolutionPlanTest {
     }
 
     @Test
-    void absentPublicHashesUseServerButLookupFailuresStayUnresolved() throws Exception {
+    void absentPublicHashesAndLookupFailuresUseServerWhenAvailable() throws Exception {
         List<Integer> progress = new ArrayList<>();
         ResolutionPlan plan = ResolutionPlan.resolve(missing(3), entry -> {
             if (entry.modId().equals("mod1")) return Optional.empty();
@@ -148,11 +152,13 @@ class ResolutionPlanTest {
         }, true, progress::add);
         assertEquals(List.of(1, 2, 3), progress);
         assertEquals(List.of(ResolutionPlan.Classification.MODRINTH_DOWNLOADABLE,
-                ResolutionPlan.Classification.SERVER_DOWNLOADABLE, ResolutionPlan.Classification.UNRESOLVED),
+                ResolutionPlan.Classification.SERVER_DOWNLOADABLE, ResolutionPlan.Classification.SERVER_DOWNLOADABLE),
                 plan.items().stream().map(ResolutionPlan.Item::classification).toList());
         assertEquals(1, plan.downloadQueue().size());
-        assertEquals(1, plan.queue(ResolutionPlan.Classification.SERVER_DOWNLOADABLE).size());
-        assertNull(plan.queue(ResolutionPlan.Classification.SERVER_DOWNLOADABLE).get(0).source().uri());
+        assertEquals(2, plan.queue(ResolutionPlan.Classification.SERVER_DOWNLOADABLE).size());
+        assertEquals(0, plan.count(ResolutionPlan.Availability.LOOKUP_FAILED));
+        assertTrue(plan.queue(ResolutionPlan.Classification.SERVER_DOWNLOADABLE).stream()
+                .allMatch(item -> item.source().uri() == null));
     }
 
     @Test

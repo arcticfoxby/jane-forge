@@ -8,12 +8,19 @@ import java.util.Locale;
 import java.util.regex.Pattern;
 
 public final class PathSafety {
-    private static final Pattern SAFE_JAR = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._+-]{0,120}\\.jar");
-    private static final Pattern RESERVED = Pattern.compile("(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\\..*)?");
+    private static final Pattern RESERVED = Pattern.compile("(?i)(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])");
     private PathSafety() { }
 
     public static String safeJarName(String name) {
-        if (name == null || !SAFE_JAR.matcher(name).matches() || name.contains("..") || RESERVED.matcher(name).matches()) {
+        try {
+            safeExistingJarName(name);
+        } catch (IllegalArgumentException exception) {
+            throw new IllegalArgumentException("Unsafe JAR file name", exception);
+        }
+        String stem = name.substring(0, name.length() - 4);
+        if (name.contains("..") || stem.isBlank() || stem.charAt(0) == '.'
+                || isSpace(stem.codePointAt(0)) || isSpace(stem.codePointBefore(stem.length()))
+                || stem.charAt(stem.length() - 1) == '.') {
             throw new IllegalArgumentException("Unsafe JAR file name");
         }
         return name;
@@ -22,7 +29,7 @@ public final class PathSafety {
     /** A basename for a physical JAR already verified inside this instance's mods directory. */
     public static String safeExistingJarName(String name) {
         if (name == null || name.length() <= 4 || name.length() > 200
-                || !name.toLowerCase(Locale.ROOT).endsWith(".jar") || RESERVED.matcher(name).matches()) {
+                || !name.toLowerCase(Locale.ROOT).endsWith(".jar") || isReservedDeviceName(name)) {
             throw new IllegalArgumentException("Unsafe existing JAR file name");
         }
         for (int index = 0; index < name.length(); index++) {
@@ -38,6 +45,16 @@ public final class PathSafety {
             }
         }
         return name;
+    }
+
+    private static boolean isSpace(int codePoint) {
+        return Character.isWhitespace(codePoint) || Character.isSpaceChar(codePoint);
+    }
+
+    private static boolean isReservedDeviceName(String name) {
+        int firstDot = name.indexOf('.');
+        String firstPart = firstDot < 0 ? name : name.substring(0, firstDot);
+        return RESERVED.matcher(firstPart.stripTrailing()).matches();
     }
 
     public static Path existingJarNamedInMods(Path gameDir, String name) throws IOException {

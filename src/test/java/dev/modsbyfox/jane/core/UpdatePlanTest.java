@@ -35,16 +35,19 @@ class UpdatePlanTest {
     }
 
     @Test
-    void replaceAcceptsUnicodeOldNameButNeverUnicodeNewNameOrCmdMetacharacters() {
+    void replaceAcceptsSafeUnicodeNamesButRejectsCmdMetacharacters() {
         String old = "【农夫乐事】farmers-delight-fabric-1.4.3.jar";
+        String replacement = "【新】farmers-delight (1.20.1).jar";
         var operation = new UpdatePlan.Operation("farmersdelight", UpdatePlan.Kind.REPLACE,
-                old, HASH, "farmers-delight-refabricated-2.5.4.jar", HASH, 100);
+                old, HASH, replacement, HASH, 100);
         assertEquals(old, operation.oldFile());
-        assertThrows(IllegalArgumentException.class, () -> new UpdatePlan.Operation("farmersdelight",
-                UpdatePlan.Kind.REPLACE, old, HASH, "【新】farmers-delight.jar", HASH, 100));
+        assertEquals(replacement, operation.newFile());
         for (String unsafe : new String[]{"old%.jar", "old!.jar", "old^.jar", "old&.jar"})
             assertThrows(IllegalArgumentException.class, () -> new UpdatePlan.Operation("farmersdelight",
                     UpdatePlan.Kind.REPLACE, unsafe, HASH, "new.jar", HASH, 100));
+        for (String unsafe : new String[]{"new%.jar", "new!.jar", "new^.jar", "new&.jar", "../new.jar"})
+            assertThrows(IllegalArgumentException.class, () -> new UpdatePlan.Operation("farmersdelight",
+                    UpdatePlan.Kind.REPLACE, old, HASH, unsafe, HASH, 100));
     }
 
     @Test

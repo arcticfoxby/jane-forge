@@ -98,7 +98,10 @@ public record ResolutionPlan(List<Item> items) {
                     .orElseGet(() -> new Item(comparison,
                             serverAvailable ? Availability.SERVER_ONLY : Availability.UNRESOLVED, null));
         } catch (IOException exception) {
-            return new Item(comparison, Availability.LOOKUP_FAILED, null);
+            // An unavailable or invalid public lookup must not block an offered server source.
+            // SERVER_ONLY still requires the player's separate trust confirmation before transfer.
+            return new Item(comparison,
+                    serverAvailable ? Availability.SERVER_ONLY : Availability.LOOKUP_FAILED, null);
         }
     }
 

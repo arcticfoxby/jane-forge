@@ -15,6 +15,7 @@ import dev.modsbyfox.jane.core.UpdatePlan;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -54,7 +55,8 @@ final class StagingService {
                 categories.put(target.modId(), classified.category());
                 return classified.source();
             } catch (IOException exception) {
-                LOGGER.warn("{}source lookup failed modId={}", prefix, target.modId(), exception);
+                LOGGER.warn("{}source lookup failed modId={} serverFallback={}", prefix, target.modId(),
+                        session.context().provider() != null, exception);
                 throw exception;
             }
         }, session.context().provider() != null,
@@ -145,14 +147,7 @@ final class StagingService {
         if (queue.isEmpty()) return new Outcome(null);
         Path staging = workspace.directory();
         ModrinthService modrinth = new ModrinthService();
-        Map<String, Integer> fileNames = new HashMap<>();
         Set<String> oldNames = new HashSet<>();
-        for (ResolutionPlan.Item item : resolution.items()) {
-            if (session.snapshot().selectedModIds().contains(item.comparison().required().modId())
-                    && (item.availability() == ResolutionPlan.Availability.TRUSTED_AVAILABLE
-                    || item.availability() == ResolutionPlan.Availability.SERVER_ONLY))
-                fileNames.merge(fileName(item).toLowerCase(Locale.ROOT), 1, Integer::sum);
-        }
         for (Comparison.Result result : session.context().results()) {
             if (result.local() != null && result.local().jar() != null) {
                 oldNames.add(result.local().jar().getFileName().toString().toLowerCase(Locale.ROOT));
@@ -160,6 +155,11 @@ final class StagingService {
             for (Comparison.LocalMod retained : result.retainedCandidates())
                 oldNames.add(retained.jar().getFileName().toString().toLowerCase(Locale.ROOT));
         }
+        Map<String, String> plannedNames = planFileNames(gameDir, resolution,
+                session.snapshot().selectedModIds(), oldNames, workspace.operations());
+        Map<String, Integer> fileNames = new HashMap<>();
+        for (String name : plannedNames.values())
+            fileNames.merge(name.toLowerCase(Locale.ROOT), 1, Integer::sum);
         for (ResolutionPlan.Item item : queue) {
             if (cancelled.getAsBoolean()) throw new InterruptedException("Sync cancelled");
             if (item.comparison().status() == Comparison.Status.FILE_ERROR
@@ -167,7 +167,7 @@ final class StagingService {
                 throw new IOException("Local file error is not downloadable");
             ManifestEntry target = item.comparison().required();
             String modId = target.modId();
-            String name = fileName(item);
+            String name = plannedNames.get(modId);
             Path part = staging.resolve(name + ".part");
             Path staged = staging.resolve(name);
             AtomicLong received = new AtomicLong();
@@ -246,6 +246,48 @@ final class StagingService {
                 ? item.trustedSource().name() : ResolutionPlan.serverSource(comparison.required()).name();
     }
 
+    /** Choose a stable name before either transfer route runs; retain names already staged as READY. */
+    static Map<String, String> planFileNames(Path gameDir, ResolutionPlan resolution, Set<String> selectedIds,
+                                             Set<String> oldNames, List<UpdatePlan.Operation> staged) throws IOException {
+        Map<String, Integer> originalCounts = new HashMap<>();
+        Map<String, String> stagedNames = new HashMap<>();
+        Set<String> occupiedStagingNames = new HashSet<>();
+        for (UpdatePlan.Operation operation : staged) {
+            stagedNames.put(operation.modId(), operation.newFile());
+            occupiedStagingNames.add(operation.newFile().toLowerCase(Locale.ROOT));
+        }
+        for (ResolutionPlan.Item item : resolution.items()) {
+            if (selectedIds.contains(item.comparison().required().modId()) && downloadable(item))
+                originalCounts.merge(fileName(item).toLowerCase(Locale.ROOT), 1, Integer::sum);
+        }
+        Map<String, String> names = new HashMap<>();
+        for (ResolutionPlan.Item item : resolution.items()) {
+            String modId = item.comparison().required().modId();
+            if (!selectedIds.contains(modId) || !downloadable(item)) continue;
+            String stagedName = stagedNames.get(modId);
+            if (stagedName != null) {
+                names.put(modId, stagedName);
+                continue;
+            }
+            String original = fileName(item);
+            String key = original.toLowerCase(Locale.ROOT);
+            String ownOld = item.comparison().local() == null ? null
+                    : item.comparison().local().jar().getFileName().toString();
+            boolean replacingOwn = ownOld != null && original.equalsIgnoreCase(ownOld);
+            Path destination = PathSafety.newJarInMods(gameDir, original);
+            boolean conflict = originalCounts.get(key) > 1 || occupiedStagingNames.contains(key)
+                    || (oldNames.contains(key) || Files.exists(destination, LinkOption.NOFOLLOW_LINKS))
+                    && !replacingOwn;
+            names.put(modId, conflict ? ResolutionPlan.serverSource(item.comparison().required()).name() : original);
+        }
+        return names;
+    }
+
+    private static boolean downloadable(ResolutionPlan.Item item) {
+        return item.availability() == ResolutionPlan.Availability.TRUSTED_AVAILABLE
+                || item.availability() == ResolutionPlan.Availability.SERVER_ONLY;
+    }
+
     static void cleanupPart(Path part) {
         try { Files.deleteIfExists(part); }
         catch (IOException exception) { LOGGER.warn("Jane could not remove incomplete download", exception); }
@@ -272,7 +314,8 @@ final class StagingService {
                                             Map<String, Integer> fileNames,
                                             Set<String> oldNames) throws IOException {
         String name = PathSafety.safeJarName(fileName);
-        if (fileNames.get(name.toLowerCase(Locale.ROOT)) > 1) throw new IOException("Duplicate download file name");
+        if (fileNames.getOrDefault(name.toLowerCase(Locale.ROOT), 0) > 1)
+            throw new IOException("Duplicate download file name");
         Comparison.LocalMod local = item.comparison().local();
         String oldName = null;
         if (local != null) {
@@ -283,7 +326,8 @@ final class StagingService {
         }
         Path destination = PathSafety.newJarInMods(gameDir, name);
         boolean replacingSameName = oldName != null && name.equalsIgnoreCase(oldName);
-        if ((Files.exists(destination) || oldNames.contains(name.toLowerCase(Locale.ROOT))) && !replacingSameName) {
+        if ((Files.exists(destination, LinkOption.NOFOLLOW_LINKS)
+                || oldNames.contains(name.toLowerCase(Locale.ROOT))) && !replacingSameName) {
             throw new IOException("Download file name conflicts with a local JAR");
         }
     }

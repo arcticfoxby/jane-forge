@@ -22,8 +22,11 @@ import java.util.Optional;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongConsumer;
 import java.util.regex.Pattern;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 final class ModrinthService {
+    private static final Logger LOGGER = LoggerFactory.getLogger("jane");
     private static final int MAX_JSON = 1024 * 1024;
     private static final Pattern PROJECT_ID = Pattern.compile("[A-Za-z0-9]{1,64}");
     private final HttpClient http;
@@ -70,11 +73,22 @@ final class ModrinthService {
                         || !target.sha512().equals(hashes.get("sha512").getAsString())) continue;
                 long size = file.get("size").getAsLong();
                 if (size != target.fileSize()) continue;
-                String name = PathSafety.safeJarName(file.get("filename").getAsString());
                 URI download = URI.create(file.get("url").getAsString());
                 if (!"https".equalsIgnoreCase(download.getScheme()) || !"cdn.modrinth.com".equalsIgnoreCase(download.getHost())
                         || download.getUserInfo() != null || download.getPort() != -1) {
                     throw new IOException("Modrinth supplied an untrusted download URL");
+                }
+                JsonElement filename = file.get("filename");
+                if (filename == null || !filename.isJsonPrimitive() || !filename.getAsJsonPrimitive().isString()
+                        || filename.getAsString().isBlank()) {
+                    throw new IOException("Modrinth response omitted a valid filename");
+                }
+                String name;
+                try {
+                    name = PathSafety.safeJarName(filename.getAsString());
+                } catch (IllegalArgumentException exception) {
+                    name = ResolutionPlan.serverSource(target).name();
+                    LOGGER.warn("Modrinth exact file for modId={} has an unsafe filename; using {}", target.modId(), name);
                 }
                 ResolutionPlan.Source source = new ResolutionPlan.Source(name, download, size);
                 ClientInstallCategory category = classify ? projectCategory(version) : ClientInstallCategory.SERVER_REQUIRED;
